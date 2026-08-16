@@ -112,6 +112,15 @@ def db_connect():
         )
     """)
 
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS market_idea_alerts (
+            market_day TEXT NOT NULL,
+            setup_key TEXT NOT NULL,
+            sent_at TEXT NOT NULL,
+            PRIMARY KEY (market_day, setup_key)
+        )
+    """)
+
     con.commit()
     return con
 
@@ -794,6 +803,293 @@ def previous_day_breakout_alerts(
 # -----------------------------
 # Main
 # -----------------------------
+
+# -----------------------------
+# MT Market Ideas / Order Block engine
+# -----------------------------
+def average_true_range(rows, period=14):
+    if len(rows) < period + 1:
+        return None
+
+    trs = []
+    for i in range(1, len(rows)):
+        high = rows[i]["high"]
+        low = rows[i]["low"]
+        prev_close = rows[i - 1]["close"]
+        trs.append(max(
+            high - low,
+            abs(high - prev_close),
+            abs(low - prev_close),
+        ))
+
+    return sum(trs[-period:]) / period
+
+
+def detect_order_blocks(rows):
+    """
+    Conservative 5m order-block detector.
+
+    Bullish OB:
+      bearish candle immediately before strong bullish displacement
+      that closes above a recent swing high.
+
+    Bearish OB:
+      bullish candle immediately before strong bearish displacement
+      that closes below a recent swing low.
+    """
+    if len(rows) < 40:
+        return []
+
+    atr = average_true_range(rows, 14)
+    if not atr or atr <= 0:
+        return []
+
+    zones = []
+    start = max(20, len(rows) - 80)
+
+    for i in range(start, len(rows) - 1):
+        ob = rows[i]
+        impulse = rows[i + 1]
+
+        body = abs(impulse["close"] - impulse["open"])
+        if body < 1.5 * atr:
+            continue
+
+        recent = rows[max(0, i - 12):i]
+        if len(recent) < 8:
+            continue
+
+        recent_high = max(x["high"] for x in recent)
+        recent_low = min(x["low"] for x in recent)
+
+        if (
+            ob["close"] < ob["open"]
+            and impulse["close"] > impulse["open"]
+            and impulse["close"] > recent_high
+        ):
+            zones.append({
+                "type": "BULLISH",
+                "low": ob["low"],
+                "high": ob["open"],
+                "origin_dt": ob["dt"],
+                "impulse_dt": impulse["dt"],
+            })
+
+        if (
+            ob["close"] > ob["open"]
+            and impulse["close"] < impulse["open"]
+            and impulse["close"] < recent_low
+        ):
+            zones.append({
+                "type": "BEARISH",
+                "low": ob["open"],
+                "high": ob["high"],
+                "origin_dt": ob["dt"],
+                "impulse_dt": impulse["dt"],
+            })
+
+    zones.sort(key=lambda z: z["impulse_dt"], reverse=True)
+    return zones[:8]
+
+
+def structure_shift(rows, direction):
+    if len(rows) < 8:
+        return False
+
+    recent = rows[-4:]
+    previous = rows[-8:-4]
+
+    if direction == "LONG":
+        return (
+            recent[-1]["close"] > max(x["high"] for x in previous)
+            and recent[-1]["close"] > recent[-2]["close"]
+        )
+
+    return (
+        recent[-1]["close"] < min(x["low"] for x in previous)
+        and recent[-1]["close"] < recent[-2]["close"]
+    )
+
+
+def setup_targets(entry, direction, previous_day, sessions):
+    candidates = []
+
+    if direction == "LONG":
+        candidates.append(("Previous Day High", previous_day["high"]))
+        for name, data in sessions.items():
+            if data and data["high"] > entry:
+                candidates.append((f"{name.title()} High", data["high"]))
+        candidates = [(n, p) for n, p in candidates if p > entry]
+        candidates.sort(key=lambda x: x[1])
+    else:
+        candidates.append(("Previous Day Low", previous_day["low"]))
+        for name, data in sessions.items():
+            if data and data["low"] < entry:
+                candidates.append((f"{name.title()} Low", data["low"]))
+        candidates = [(n, p) for n, p in candidates if p < entry]
+        candidates.sort(key=lambda x: x[1], reverse=True)
+
+    return candidates
+
+
+def select_trade_plan(entry_zone, direction, previous_day, sessions, atr):
+    if not atr or atr <= 0:
+        return None
+
+    entry_low = entry_zone["low"]
+    entry_high = entry_zone["high"]
+    entry = (entry_low + entry_high) / 2
+
+    if direction == "LONG":
+        sl = entry_low - 0.35 * atr
+    else:
+        sl = entry_high + 0.35 * atr
+
+    risk = abs(entry - sl)
+    if risk <= 0:
+        return None
+
+    valid = []
+    for name, target in setup_targets(
+        entry, direction, previous_day, sessions
+    ):
+        rr = abs(target - entry) / risk
+        if rr >= 2.0:
+            valid.append((name, target, rr))
+
+    if not valid:
+        return None
+
+    tp1 = valid[0]
+    tp2 = valid[-1]
+
+    return {
+        "entry_low": entry_low,
+        "entry_high": entry_high,
+        "sl": sl,
+        "tp1_name": tp1[0],
+        "tp1": tp1[1],
+        "rr1": tp1[2],
+        "tp2_name": tp2[0],
+        "tp2": tp2[1],
+        "rr2": tp2[2],
+    }
+
+
+def market_idea_message(direction, grade, trend, zone, plan):
+    side = "🟢 POTENTIAL LONG" if direction == "LONG" else "🔴 POTENTIAL SHORT"
+
+    return (
+        "🧠 MT MARKET IDEA\n\n"
+        f"{side}\n"
+        f"⭐ QUALITY: {grade}\n"
+        f"📈 MARKET TREND: {trend}\n\n"
+        "📦 ORDER BLOCK\n"
+        f"{fmt_price(zone['low'])} — {fmt_price(zone['high'])}\n\n"
+        "📍 ENTRY ZONE\n"
+        f"{fmt_price(plan['entry_low'])} — {fmt_price(plan['entry_high'])}\n\n"
+        f"🛑 SL: {fmt_price(plan['sl'])}\n\n"
+        f"🎯 TP1: {fmt_price(plan['tp1'])} ({plan['tp1_name']})\n"
+        f"🎯 R:R: 1:{plan['rr1']:.2f}\n\n"
+        f"🎯 TP2: {fmt_price(plan['tp2'])} ({plan['tp2_name']})\n"
+        f"🎯 R:R: 1:{plan['rr2']:.2f}\n\n"
+        "🧭 LOGIC\n"
+        "• Trend-aligned setup\n"
+        "• Order block + displacement\n"
+        "• Price interacting with the OB\n"
+        "• R:R minimum 1:2\n\n"
+        "⚠️ Scenario, not a guaranteed trade.\n"
+        "Wait for confirmation before acting."
+    )
+
+
+def maybe_market_idea(con, day, rows, previous_day, sessions, trend):
+    """
+    At most one fresh A+ scenario per detected OB/day.
+    Never fights the trend.
+    Requires:
+      - current price inside a recent aligned OB
+      - 5m structure shift
+      - minimum R:R 1:2
+    """
+    if trend not in {"BULLISH", "BEARISH"}:
+        return 0
+
+    if len(rows) < 40:
+        return 0
+
+    price = rows[-1]["close"]
+    atr = average_true_range(rows, 14)
+    zones = detect_order_blocks(rows)
+
+    if not zones:
+        return 0
+
+    desired = "BULLISH" if trend == "BULLISH" else "BEARISH"
+    direction = "LONG" if trend == "BULLISH" else "SHORT"
+
+    for zone in zones:
+        if zone["type"] != desired:
+            continue
+
+        if not (zone["low"] <= price <= zone["high"]):
+            continue
+
+        if not structure_shift(rows, direction):
+            continue
+
+        plan = select_trade_plan(
+            zone,
+            direction,
+            previous_day,
+            sessions,
+            atr,
+        )
+
+        if not plan:
+            continue
+
+        setup_key = (
+            f"{direction}|"
+            f"{zone['origin_dt'].isoformat()}|"
+            f"{zone['impulse_dt'].isoformat()}"
+        )
+
+        already = con.execute(
+            """
+            SELECT 1 FROM market_idea_alerts
+            WHERE market_day=? AND setup_key=?
+            """,
+            (str(day), setup_key),
+        ).fetchone()
+
+        if already:
+            continue
+
+        telegram_send(
+            market_idea_message(
+                direction,
+                "A+",
+                trend,
+                zone,
+                plan,
+            )
+        )
+
+        con.execute(
+            "INSERT INTO market_idea_alerts VALUES (?, ?, ?)",
+            (
+                str(day),
+                setup_key,
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        con.commit()
+
+        return 1
+
+    return 0
+
 def main():
     con = db_connect()
     now = datetime.now(TZ)
@@ -982,6 +1278,19 @@ def main():
             candles15,
         )
 
+    # --------------------------------------------------------
+    # MT MARKET IDEA
+    # Trend -> Order Block -> Structure Shift -> R:R >= 1:2
+    # --------------------------------------------------------
+    market_ideas = maybe_market_idea(
+        con,
+        today,
+        today_rows,
+        previous_day_data,
+        sessions,
+        trend,
+    )
+
     session_count = sum(
         1
         for v in sessions.values()
@@ -1000,6 +1309,7 @@ def main():
         f"Equilibrium alerts: {eq_alerts}. "
         f"Session breakout alerts: {breakout_alerts}. "
         f"Previous-day breakout alerts: {previous_day_breakouts}. "
+        f"Market ideas: {market_ideas}. "
         f"Latest XAU/USD: "
         f"{fmt_price(current_price) if current_price is not None else 'N/A'}."
     )
