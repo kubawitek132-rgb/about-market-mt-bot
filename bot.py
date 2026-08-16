@@ -449,16 +449,23 @@ def main():
 
     reference_day = completed[-1]
     reference = ranges[reference_day]
-    sd = session_ranges(rows5, reference_day)
+
+    # The daily report uses the latest completed market day.
+    # Intraday session breakouts use the CURRENT market day's sessions:
+    # London watches today's Asia range; New York watches today's London range.
+    current_session_data = session_ranges(rows5, current_day)
 
     trend_days = [ranges[d] for d in completed[-5:]]
     trend, reason = trend_from_structure(trend_days)
 
-    daily_sent = False
-    if now.hour >= 23:
-        daily_sent = send_daily_report(
-            con, reference_day, reference, sd, trend, reason
-        )
+    # Always attempt to publish the latest completed daily report.
+    # The database prevents duplicates, so if GitHub misses the 23:00 run,
+    # the next 5-minute run will still publish the report.
+    daily_sent = send_daily_report(
+        con, reference_day, reference,
+        session_ranges(rows5, reference_day),
+        trend, reason
+    )
 
     # 1m price polling for Equilibrium / session breakouts.
     rows1 = candles("1min", 50)
@@ -478,7 +485,8 @@ def main():
             con, reference_day, reference["equilibrium"], current_price
         )
         breakout_alerts = check_session_breakouts(
-            con, reference_day, sd, current_price, previous_price, now
+            con, current_day, current_session_data,
+            current_price, previous_price, now
         )
 
         con.execute("""
@@ -503,6 +511,7 @@ def main():
 
     print(
         f"Completed day: {reference_day}. "
+        f"Current market day: {current_day}. "
         f"Trend: {trend}. "
         f"Daily report sent: {daily_sent}. "
         f"Equilibrium alerts: {eq_alerts}. "
