@@ -148,7 +148,18 @@ def candles(interval="5min", outputsize=5000):
 
 
 def market_day(dt):
-    return dt.date() if dt.hour >= 23 else (dt - timedelta(days=1)).date()
+    """
+    Market-day label is the calendar date on which the session closes at 23:00
+    Europe/Warsaw.
+
+    Therefore:
+      2026-08-16 23:00 -> market day 2026-08-17
+      2026-08-17 00:40 -> market day 2026-08-17
+
+    The completed Previous Day for 2026-08-17 is therefore the range
+    2026-08-15 23:00 -> 2026-08-16 22:59:59.
+    """
+    return dt.date() + timedelta(days=1) if dt.hour >= 23 else dt.date()
 
 
 def daily_ranges(rows):
@@ -516,7 +527,9 @@ def main():
 
     # --------------------------------------------------------
     # MODULE 1: PREVIOUS DAY HIGH / LOW
-    # Previous day is the completed 23:00 -> 23:00 Warsaw range.
+    # Previous Day is the most recently completed 23:00 -> 23:00 Warsaw range.
+    # With the closing-date convention, at 00:40 on Aug 17 the Previous Day
+    # is the market day labeled Aug 16.
     # --------------------------------------------------------
     ranges = daily_ranges(rows5)
     current_market_day = market_day(now)
@@ -619,7 +632,8 @@ def main():
         f"Current date: {today}. "
         f"Trend: {trend}. "
         f"Daily report sent: {daily_sent}. "
-        f"Sessions calculated: {sum(1 for v in current_sessions.values() if v is not None)}/3. "
+        f"Sessions calculated for {today}: "
+        f"{sum(1 for v in current_sessions.values() if v is not None)}/3. "
         f"Equilibrium alerts: {eq_alerts}. "
         f"Session breakout alerts: {breakout_alerts}. "
         f"Previous-day key alerts: {key_alerts}. "
