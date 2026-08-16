@@ -191,7 +191,7 @@ def session_ranges(rows, target_market_day):
 
 
 def fmt_price(v):
-    return f"{v:,.2f}"
+    return f"{v:,.3f}"
 
 
 def trend_from_structure(days):
@@ -432,12 +432,74 @@ def previous_day_confirmations(con, day, d, rows15):
     return sent
 
 
+def aggregate_15m_from_5m(rows5):
+    """
+    Build 15-minute OHLC candles from the same 5-minute feed.
+
+    This keeps the workflow to one Twelve Data request per run and ensures
+    all calculations use the same XAU/USD data source and Warsaw timezone.
+    """
+    buckets = {}
+
+    for row in rows5:
+        # Round down to the start of the 15-minute bucket.
+        minute = (row["dt"].minute // 15) * 15
+        bucket_dt = row["dt"].replace(minute=minute, second=0, microsecond=0)
+
+        bucket = buckets.setdefault(
+            bucket_dt,
+            {
+                "dt": bucket_dt,
+                "open": row["open"],
+                "high": row["high"],
+                "low": row["low"],
+                "close": row["close"],
+                "last_dt": row["dt"],
+            },
+        )
+
+        if row["dt"] < bucket["last_dt"]:
+            bucket["open"] = row["open"]
+
+        bucket["high"] = max(bucket["high"], row["high"])
+        bucket["low"] = min(bucket["low"], row["low"])
+
+        if row["dt"] >= bucket["last_dt"]:
+            bucket["close"] = row["close"]
+            bucket["last_dt"] = row["dt"]
+
+    out = []
+    now = datetime.now(TZ)
+
+    for bucket_dt, bucket in sorted(buckets.items()):
+        # Only completed 15m candles.
+        if bucket_dt + timedelta(minutes=15) <= now:
+            out.append(
+                {
+                    "dt": bucket_dt,
+                    "open": bucket["open"],
+                    "high": bucket["high"],
+                    "low": bucket["low"],
+                    "close": bucket["close"],
+                }
+            )
+
+    return out
+
+
 def main():
     con = db_connect()
     now = datetime.now(TZ)
 
-    # 5m data for daily/session calculations.
+    # One 5-minute request per workflow run.
+    # This is enough for exact daily/session HIGH/LOW because those values
+    # come from the high/low fields of each intraday candle.
     rows5 = candles("5min", 5000)
+
+    if not rows5:
+        print("No XAU/USD 5m data returned.")
+        return
+
     ranges = daily_ranges(rows5)
 
     current_day = market_day(now)
@@ -447,66 +509,83 @@ def main():
         print("No completed market day available.")
         return
 
+    # Latest completed market day — used for the daily report.
     reference_day = completed[-1]
     reference = ranges[reference_day]
-
-    # The daily report uses the latest completed market day.
-    # Intraday session breakouts use the CURRENT market day's sessions:
-    # London watches today's Asia range; New York watches today's London range.
-    current_session_data = session_ranges(rows5, current_day)
+    reference_sessions = session_ranges(rows5, reference_day)
 
     trend_days = [ranges[d] for d in completed[-5:]]
     trend, reason = trend_from_structure(trend_days)
 
-    # Always attempt to publish the latest completed daily report.
-    # The database prevents duplicates, so if GitHub misses the 23:00 run,
-    # the next 5-minute run will still publish the report.
+    # Always attempt to send the latest completed daily report.
+    # SQLite prevents duplicates, so a missed 23:00 run can be recovered
+    # by the next 5-minute workflow run.
     daily_sent = send_daily_report(
-        con, reference_day, reference,
-        session_ranges(rows5, reference_day),
-        trend, reason
+        con,
+        reference_day,
+        reference,
+        reference_sessions,
+        trend,
+        reason,
     )
 
-    # 1m price polling for Equilibrium / session breakouts.
-    rows1 = candles("1min", 50)
-    current_price = rows1[-1]["close"] if rows1 else None
+    # Current market-day session ranges:
+    # London watches today's Asia; New York watches today's London.
+    current_sessions = session_ranges(rows5, current_day)
+
+    # Latest observed XAU/USD price from the same 5m feed.
+    current_price = rows5[-1]["close"]
 
     row = con.execute(
         "SELECT last_price FROM session_breakout_state WHERE market_day=?",
-        (str(reference_day),),
+        (str(current_day),),
     ).fetchone()
     previous_price = float(row[0]) if row else None
 
-    eq_alerts = 0
-    breakout_alerts = 0
+    eq_alerts = check_equilibrium_zone(
+        con,
+        reference_day,
+        reference["equilibrium"],
+        current_price,
+    )
 
-    if current_price is not None:
-        eq_alerts = check_equilibrium_zone(
-            con, reference_day, reference["equilibrium"], current_price
-        )
-        breakout_alerts = check_session_breakouts(
-            con, current_day, current_session_data,
-            current_price, previous_price, now
-        )
+    breakout_alerts = check_session_breakouts(
+        con,
+        current_day,
+        current_sessions,
+        current_price,
+        previous_price,
+        now,
+    )
 
-        con.execute("""
-            INSERT INTO session_breakout_state
-                (market_day, last_price, updated_at)
-            VALUES (?, ?, ?)
-            ON CONFLICT(market_day) DO UPDATE SET
-                last_price=excluded.last_price,
-                updated_at=excluded.updated_at
-        """, (str(reference_day), current_price, datetime.now(timezone.utc).isoformat()))
-        con.commit()
+    con.execute(
+        """
+        INSERT INTO session_breakout_state
+            (market_day, last_price, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(market_day) DO UPDATE SET
+            last_price=excluded.last_price,
+            updated_at=excluded.updated_at
+        """,
+        (
+            str(current_day),
+            current_price,
+            datetime.now(timezone.utc).isoformat(),
+        ),
+    )
+    con.commit()
 
-    # 15m confirmation for previous-day High/Low.
-    rows15 = candles("15min", 200)
-    completed15 = [
-        r for r in rows15
-        if r["dt"] + timedelta(minutes=15) <= now
-    ]
+    # 15m confirmation built locally from the same 5m candles.
+    rows15 = aggregate_15m_from_5m(rows5)
     key_alerts = previous_day_confirmations(
-        con, reference_day, reference, completed15
+        con,
+        reference_day,
+        reference,
+        rows15,
+    )
+
+    session_counts = sum(
+        1 for v in reference_sessions.values() if v is not None
     )
 
     print(
@@ -514,11 +593,14 @@ def main():
         f"Current market day: {current_day}. "
         f"Trend: {trend}. "
         f"Daily report sent: {daily_sent}. "
+        f"Reference sessions calculated: {session_counts}/3. "
         f"Equilibrium alerts: {eq_alerts}. "
         f"Session breakout alerts: {breakout_alerts}. "
-        f"Previous-day key alerts: {key_alerts}."
+        f"Previous-day key alerts: {key_alerts}. "
+        f"Latest XAU/USD close: {fmt_price(current_price)}."
     )
 
 
 if __name__ == "__main__":
     main()
+
