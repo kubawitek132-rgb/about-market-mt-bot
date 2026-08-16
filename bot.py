@@ -519,6 +519,16 @@ def main():
     now = datetime.now(TZ)
     today = now.date()
 
+    # Weekend is completely ignored.
+    # No daily reports, session calculations or intraday alerts are sent on
+    # Saturday or Sunday. Monday automatically resolves Previous Day to Friday.
+    if today.weekday() >= 5:
+        print(
+            f"Weekend ({today.isoformat()}). "
+            "No market calculations or alerts."
+        )
+        return
+
     # One 5-minute request per workflow run.
     rows5 = candles("5min", 5000)
     if not rows5:
