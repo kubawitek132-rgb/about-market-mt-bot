@@ -323,50 +323,27 @@ def all_sessions_for_day(rows, day):
 
 
 # -----------------------------
-# Trend
+# Daily close status
 # -----------------------------
-def trend_from_daily_ranges(days):
-    if len(days) < 3:
-        return "NEUTRAL", "Not enough completed trading days"
+def trend_from_previous_day_close(closing_price, previous_day):
+    """Classify a completed day using only the prior day's High/Low.
 
-    a, b, c = days[-3], days[-2], days[-1]
+    No equilibrium, EMA, or multi-day structure is used for this status.
+    """
+    if closing_price > previous_day["high"]:
+        return "BULLISH TREND", "Daily close above Previous Day High"
 
-    bullish = (
-        b["high"] >= a["high"]
-        and b["low"] >= a["low"]
-        and c["high"] >= b["high"]
-        and c["low"] >= b["low"]
-        and (c["high"] > a["high"] or c["low"] > a["low"])
-    )
+    if closing_price < previous_day["low"]:
+        return "BEARISH TREND", "Daily close below Previous Day Low"
 
-    bearish = (
-        b["high"] <= a["high"]
-        and b["low"] <= a["low"]
-        and c["high"] <= b["high"]
-        and c["low"] <= b["low"]
-        and (c["high"] < a["high"] or c["low"] < a["low"])
-    )
-
-    if bullish:
-        return "BULLISH", "Higher-high / higher-low structure"
-
-    if bearish:
-        return "BEARISH", "Lower-high / lower-low structure"
-
-    if c["close"] > b["close"] and c["close"] > c["equilibrium"]:
-        return "BULLISH", "Price above equilibrium with rising close"
-
-    if c["close"] < b["close"] and c["close"] < c["equilibrium"]:
-        return "BEARISH", "Price below equilibrium with falling close"
-
-    return "NEUTRAL", "Mixed structure"
+    return "INSIDE DAY", "Daily close inside Previous Day High/Low"
 
 
 def trend_icon(trend):
     return {
-        "BULLISH": "📈",
-        "BEARISH": "📉",
-        "NEUTRAL": "⚪",
+        "BULLISH TREND": "📈",
+        "BEARISH TREND": "📉",
+        "INSIDE DAY": "↔️",
     }.get(trend, "⚪")
 
 
@@ -975,7 +952,7 @@ def maybe_market_idea(con, day, rows, previous_day, sessions, trend):
       - 5m structure shift
       - minimum R:R 1:2
     """
-    if trend not in {"BULLISH", "BEARISH"}:
+    if trend not in {"BULLISH TREND", "BEARISH TREND"}:
         return 0
 
     if len(rows) < 40:
@@ -988,8 +965,16 @@ def maybe_market_idea(con, day, rows, previous_day, sessions, trend):
     if not zones:
         return 0
 
-    desired = "BULLISH" if trend == "BULLISH" else "BEARISH"
-    direction = "LONG" if trend == "BULLISH" else "SHORT"
+    desired = (
+        "BULLISH"
+        if trend == "BULLISH TREND"
+        else "BEARISH"
+    )
+    direction = (
+        "LONG"
+        if trend == "BULLISH TREND"
+        else "SHORT"
+    )
 
     for zone in zones:
         if zone["type"] != desired:
@@ -1102,33 +1087,6 @@ def main():
     sessions = all_sessions_for_day(today_rows, today)
 
     # --------------------------------------------------------
-    # Trend: latest completed weekday daily ranges.
-    # Use exact 23:00->23:00 windows, not provider 1D candles.
-    # --------------------------------------------------------
-    trend_days = []
-
-    cursor = previous_day
-
-    for _ in range(5):
-        data, _ = daily_range_for_label(cursor)
-
-        if data:
-            trend_days.append(
-                {
-                    "high": data["high"],
-                    "low": data["low"],
-                    "equilibrium": data["equilibrium"],
-                    "close": data["close"],
-                }
-            )
-
-        cursor = previous_weekday(cursor)
-
-    trend_days = list(reversed(trend_days))
-
-    trend, reason = trend_from_daily_ranges(trend_days)
-
-    # --------------------------------------------------------
     # Daily report:
     #
     # After 23:00, report the just-completed trading day itself.
@@ -1157,6 +1115,24 @@ def main():
             for name in ("ASIA", "LONDON", "NEW YORK")
         }
 
+    # The report status is based only on the completed report-day close
+    # relative to the High/Low of the trading day immediately before it.
+    report_previous_day = previous_weekday(report_day)
+    if report_previous_day == previous_day:
+        report_previous_day_data = previous_day_data
+    else:
+        report_previous_day_data, _ = daily_range_for_label(
+            report_previous_day
+        )
+
+    if report_data and report_previous_day_data:
+        trend, reason = trend_from_previous_day_close(
+            report_data["close"],
+            report_previous_day_data,
+        )
+    else:
+        trend, reason = "INSIDE DAY", "Previous Day range unavailable"
+
     daily_sent = False
 
     if report_data:
@@ -1176,6 +1152,18 @@ def main():
     current_price = (
         today_rows[-1]["close"] if today_rows else None
     )
+
+    # Intraday market-idea direction follows the same Previous Day High/Low
+    # rule, using the latest completed M5 close.  There is no equilibrium or
+    # multi-day-structure fallback.
+    live_candle5 = latest_completed_5m_candle(today_rows, now)
+    if live_candle5:
+        live_trend, _ = trend_from_previous_day_close(
+            live_candle5["close"],
+            previous_day_data,
+        )
+    else:
+        live_trend = "INSIDE DAY"
 
     eq_alerts = 0
     breakout_alerts = 0
@@ -1232,18 +1220,16 @@ def main():
         con.commit()
 
         # Previous Day HIGH/LOW breakout -> latest completed M5 close.
-        candle5 = latest_completed_5m_candle(today_rows, now)
-
         previous_day_breakouts = previous_day_breakout_alerts(
             con,
             previous_day,
             previous_day_data,
-            candle5,
+            live_candle5,
         )
 
     # --------------------------------------------------------
     # MT MARKET IDEA
-    # Trend -> Order Block -> Structure Shift -> R:R >= 1:2
+    # Previous Day High/Low direction -> Order Block -> Structure Shift -> R:R >= 1:2
     # --------------------------------------------------------
     market_ideas = maybe_market_idea(
         con,
@@ -1251,7 +1237,7 @@ def main():
         today_rows,
         previous_day_data,
         sessions,
-        trend,
+        live_trend,
     )
 
     session_count = sum(
