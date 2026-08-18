@@ -1,9 +1,12 @@
-# ABOUT MARKET MT BOT — XAUUSD V1
+ABOUT MARKET MT BOT — XAUUSD V1
 
 Purpose:
 - Report the completed XAUUSD daily High and Low at the 23:00 Europe/Warsaw boundary.
 - Calculate exact 50% Equilibrium.
-- Classify the multi-day market structure as BULLISH, BEARISH or NEUTRAL.
+- Classify the completed day only from its close relative to the prior day's High/Low:
+  - close above Previous Day High = BULLISH TREND;
+  - close below Previous Day Low = BEARISH TREND;
+  - close inside that range = INSIDE DAY.
 - During the following day, monitor the previous day's High, Low and Equilibrium.
 - Send a key-level update immediately after a completed 5-minute candle confirms the move.
 - Send an Equilibrium Zone alert when the latest observed price enters the band from Equilibrium - $1.00 to Equilibrium.
