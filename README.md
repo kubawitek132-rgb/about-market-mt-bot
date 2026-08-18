@@ -5,7 +5,7 @@ Purpose:
 - Calculate exact 50% Equilibrium.
 - Classify the multi-day market structure as BULLISH, BEARISH or NEUTRAL.
 - During the following day, monitor the previous day's High, Low and Equilibrium.
-- Send a key-level update only after a completed 15-minute candle confirms the move.
+- Send a key-level update immediately after a completed 5-minute candle confirms the move.
 - Send an Equilibrium Zone alert when the latest observed price enters the band from Equilibrium - $1.00 to Equilibrium.
 
 Daily boundary:
@@ -18,6 +18,7 @@ Telegram secrets:
 TELEGRAM_BOT_TOKEN
 TELEGRAM_CHAT_ID
 TELEGRAM_MESSAGE_THREAD_ID
+
 
 Important:
 This bot is a market-structure/reference tool, not a trading signal or financial advice.
@@ -43,6 +44,14 @@ The daily report also includes session ranges using Europe/Warsaw time:
 
 The end time is exclusive. These session ranges are calculated from the
 same XAUUSD 5-minute reference data used by the bot.
+
+
+## Previous Day High / Low breakouts
+
+- A Previous Day High or Low alert requires the close of a fully completed
+  five-minute candle beyond that level.
+- The workflow polls every five minutes, so the alert is sent on the first run
+  after that M5 candle closes.
 
 
 ## Intraday Session Breakouts
