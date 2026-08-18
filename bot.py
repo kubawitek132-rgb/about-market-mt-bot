@@ -34,7 +34,7 @@ import requests
 #   - London watches current-day Asia High/Low
 #   - New York watches current-day London High/Low
 #   - Equilibrium zone uses Previous Trading Day Equilibrium
-#   - Previous Day High/Low breakout requires a completed 15m close
+#   - Previous Day High/Low breakout requires a completed M5 close
 #
 # WEEKENDS:
 #   Saturday/Sunday are ignored completely.
@@ -668,65 +668,28 @@ def check_session_breakouts(
 
 
 # -----------------------------
-# 15m aggregation / previous-day breakouts
+# Completed M5 candle / previous-day breakouts
 # -----------------------------
-def aggregate_15m_from_5m(rows):
-    buckets = {}
-
-    for row in rows:
-        bucket_minute = (row["dt"].minute // 15) * 15
-        bucket_dt = row["dt"].replace(
-            minute=bucket_minute,
-            second=0,
-            microsecond=0,
-        )
-
-        if bucket_dt not in buckets:
-            buckets[bucket_dt] = {
-                "dt": bucket_dt,
-                "open": row["open"],
-                "high": row["high"],
-                "low": row["low"],
-                "close": row["close"],
-                "last_dt": row["dt"],
-            }
-        else:
-            b = buckets[bucket_dt]
-            b["high"] = max(b["high"], row["high"])
-            b["low"] = min(b["low"], row["low"])
-
-            if row["dt"] >= b["last_dt"]:
-                b["close"] = row["close"]
-                b["last_dt"] = row["dt"]
-
-    now = datetime.now(TZ)
-    output = []
-
-    for bucket_dt, b in sorted(buckets.items()):
-        if bucket_dt + timedelta(minutes=15) <= now:
-            output.append(
-                {
-                    "dt": bucket_dt,
-                    "open": b["open"],
-                    "high": b["high"],
-                    "low": b["low"],
-                    "close": b["close"],
-                }
-            )
-
-    return output
+def latest_completed_5m_candle(rows, now):
+    """Return the latest M5 candle only after its five-minute interval ended."""
+    completed = [
+        row
+        for row in rows
+        if row["dt"] + timedelta(minutes=5) <= now
+    ]
+    return completed[-1] if completed else None
 
 
 def previous_day_breakout_alerts(
     con,
     previous_day,
     previous_day_data,
-    candles15,
+    candle5,
 ):
-    if not candles15:
+    if not candle5:
         return 0
 
-    close = candles15[-1]["close"]
+    close = candle5["close"]
     sent = 0
 
     if close > previous_day_data["high"]:
@@ -746,8 +709,8 @@ def previous_day_breakout_alerts(
             telegram_send(
                 "🚨 XAUUSD — PREVIOUS DAY HIGH BROKEN\n\n"
                 f"🎯 Level: {fmt_price(previous_day_data['high'])}\n"
-                f"💰 15m Close: {fmt_price(close)}\n\n"
-                "✅ Confirmed by 15m candle close."
+                f"💰 M5 Close: {fmt_price(close)}\n\n"
+                "✅ Confirmed by a completed M5 candle."
             )
 
             con.execute(
@@ -780,8 +743,8 @@ def previous_day_breakout_alerts(
             telegram_send(
                 "🚨 XAUUSD — PREVIOUS DAY LOW BROKEN\n\n"
                 f"🎯 Level: {fmt_price(previous_day_data['low'])}\n"
-                f"💰 15m Close: {fmt_price(close)}\n\n"
-                "✅ Confirmed by 15m candle close."
+                f"💰 M5 Close: {fmt_price(close)}\n\n"
+                "✅ Confirmed by a completed M5 candle."
             )
 
             con.execute(
@@ -1268,14 +1231,14 @@ def main():
 
         con.commit()
 
-        # Previous Day HIGH/LOW breakout -> completed 15m close.
-        candles15 = aggregate_15m_from_5m(today_rows)
+        # Previous Day HIGH/LOW breakout -> latest completed M5 close.
+        candle5 = latest_completed_5m_candle(today_rows, now)
 
         previous_day_breakouts = previous_day_breakout_alerts(
             con,
             previous_day,
             previous_day_data,
-            candles15,
+            candle5,
         )
 
     # --------------------------------------------------------
